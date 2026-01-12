@@ -20,13 +20,24 @@ logger = logging.getLogger(__name__)
 # Load environment variables
 load_dotenv()
 
+# Default events to track (matching flask_server.py)
+DEFAULT_EVENTS = [
+    'select_menu_category',
+    'open_item_details',
+    'select_commerce_category',
+    'select_vendor',
+    'add_item_to_favorites',
+    'view_item'
+]
+
 
 class BigQueryExtractor:
     def __init__(self):
         # BigQuery Configuration
         self.bq_project_id = os.getenv('BQ_PROJECT_ID')
         self.bq_dataset = os.getenv('BQ_DATASET')
-        self.bq_table = os.getenv('BQ_TABLE')
+        self.bq_table_prefix = os.getenv('BQ_TABLE_PREFIX', 'events_')
+        self.bq_location = os.getenv('BQ_LOCATION', 'US')
         self.bq_credentials_path = os.getenv('BQ_CREDENTIALS_PATH')
 
         # PostgreSQL Configuration
@@ -43,17 +54,15 @@ class BigQueryExtractor:
     def connect_bigquery(self):
         """Establish connection to BigQuery"""
         try:
-            if self.bq_credentials_path:
-                credentials = service_account.Credentials.from_service_account_file(
-                    self.bq_credentials_path
-                )
-                self.bq_client = bigquery.Client(
-                    credentials=credentials,
-                    project=self.bq_project_id
-                )
-            else:
-                self.bq_client = bigquery.Client(project=self.bq_project_id)
-
+            credentials = service_account.Credentials.from_service_account_file(
+                self.bq_credentials_path,
+                scopes=["https://www.googleapis.com/auth/cloud-platform"]
+            )
+            self.bq_client = bigquery.Client(
+                credentials=credentials,
+                project=self.bq_project_id,
+                location=self.bq_location
+            )
             logger.info("Successfully connected to BigQuery")
         except Exception as e:
             logger.error(f"Failed to connect to BigQuery: {e}")
@@ -74,8 +83,8 @@ class BigQueryExtractor:
             logger.error(f"Failed to connect to PostgreSQL: {e}")
             raise
 
-    def build_query(self, date_from, date_to, events=None, additional_filters=None):
-        """Build BigQuery SQL query with date range and event filters"""
+    def build_query(self, date_from, date_to, events=None):
+        """Build BigQuery SQL query with date range and event filters (using wildcard tables)"""
 
         # Build event filter
         event_filter = ""
@@ -83,38 +92,34 @@ class BigQueryExtractor:
             event_list = "', '".join(events)
             event_filter = f"AND event_name IN ('{event_list}')"
 
-        # Build additional filters
-        extra_filter = ""
-        if additional_filters:
-            extra_filter = f"AND {additional_filters}"
+        # Use wildcard table pattern (e.g., events_*)
+        table_wildcard = f"{self.bq_project_id}.{self.bq_dataset}.{self.bq_table_prefix}*"
+
+        # Convert dates to table suffixes (YYYYMMDD format)
+        date_from_suffix = datetime.strptime(date_from, '%Y-%m-%d').strftime('%Y%m%d')
+        date_to_suffix = datetime.strptime(date_to, '%Y-%m-%d').strftime('%Y%m%d')
 
         query = f"""
         SELECT
-            event_id,
+            user_id,
             event_name,
             event_timestamp,
-            user_id,
-            session_id,
-            TO_JSON_STRING(event_params) as event_data,
-            TO_JSON_STRING(user_properties) as user_properties,
-            TO_JSON_STRING(device) as device_info,
-            geo.country as country,
-            geo.city as city,
-            platform,
-            app_info.version as app_version
-        FROM `{self.bq_project_id}.{self.bq_dataset}.{self.bq_table}`
-        WHERE DATE(event_timestamp) BETWEEN '{date_from}' AND '{date_to}'
+            event_params,
+            event_date
+        FROM `{table_wildcard}`
+        WHERE _TABLE_SUFFIX BETWEEN '{date_from_suffix}' AND '{date_to_suffix}'
+            AND user_id IS NOT NULL
+            AND user_id != ''
             {event_filter}
-            {extra_filter}
         ORDER BY event_timestamp DESC
         """
 
         return query
 
-    def extract_data(self, date_from, date_to, events=None, additional_filters=None):
+    def extract_data(self, date_from, date_to, events=None):
         """Extract data from BigQuery with filters"""
         try:
-            query = self.build_query(date_from, date_to, events, additional_filters)
+            query = self.build_query(date_from, date_to, events)
 
             logger.info(f"Extracting data from {date_from} to {date_to}")
             if events:
@@ -124,34 +129,49 @@ class BigQueryExtractor:
             logger.debug(f"Query: {query}")
 
             query_job = self.bq_client.query(query)
-            results = query_job.result()
+            results = list(query_job.result())
 
-            total_rows = results.total_rows
-            logger.info(f"Extracted {total_rows} rows from BigQuery")
+            logger.info(f"Extracted {len(results)} rows from BigQuery")
 
-            return results, query
+            return results
 
         except Exception as e:
             logger.error(f"Failed to extract data from BigQuery: {e}")
             raise
 
     def export_to_csv(self, data, output_file='export.csv'):
-        """Export data to CSV file"""
+        """Export data to CSV file (matching flask_server.py schema)"""
         try:
             logger.info(f"Exporting data to {output_file}...")
 
             with open(output_file, 'w', newline='', encoding='utf-8') as csvfile:
-                writer = None
+                # Define CSV headers matching PostgreSQL table structure
+                fieldnames = ['user_id', 'event_date', 'event_timestamp', 'event_name', 'event_id', 'event_name_detail']
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                writer.writeheader()
+
                 row_count = 0
-
                 for row in data:
-                    row_dict = dict(row)
+                    # Extract event parameters (matching flask_server.py logic)
+                    event_id = None
+                    event_name_detail = None
 
-                    if writer is None:
-                        writer = csv.DictWriter(csvfile, fieldnames=row_dict.keys())
-                        writer.writeheader()
+                    if row.event_params:
+                        for param in row.event_params:
+                            if param.get('key') == 'id':
+                                event_id = param.get('value', {}).get('string_value')
+                            if param.get('key') == 'name':
+                                event_name_detail = param.get('value', {}).get('string_value')
 
-                    writer.writerow(row_dict)
+                    # Write row
+                    writer.writerow({
+                        'user_id': row.user_id,
+                        'event_date': row.event_date,
+                        'event_timestamp': row.event_timestamp,
+                        'event_name': row.event_name,
+                        'event_id': event_id,
+                        'event_name_detail': event_name_detail
+                    })
                     row_count += 1
 
                     if row_count % 1000 == 0:
@@ -165,56 +185,81 @@ class BigQueryExtractor:
             raise
 
     def load_to_postgres(self, data, batch_size=1000):
-        """Load data into PostgreSQL"""
-        insert_query = f"""
-        INSERT INTO {self.pg_table}
-        (event_id, event_name, event_timestamp, user_id, session_id,
-         event_data, user_properties, device_info)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (event_id) DO UPDATE SET
-            event_name = EXCLUDED.event_name,
-            event_timestamp = EXCLUDED.event_timestamp,
-            user_id = EXCLUDED.user_id,
-            session_id = EXCLUDED.session_id,
-            event_data = EXCLUDED.event_data,
-            user_properties = EXCLUDED.user_properties,
-            device_info = EXCLUDED.device_info
-        """
-
+        """Load data into PostgreSQL (matching flask_server.py schema)"""
         try:
+            logger.info("Setting up PostgreSQL table...")
+
+            # Create table if not exists (matching flask_server.py)
+            cursor = self.pg_conn.cursor()
+            create_table_query = f"""
+            CREATE TABLE IF NOT EXISTS {self.pg_table} (
+                id SERIAL PRIMARY KEY,
+                user_id VARCHAR(255),
+                event_date DATE,
+                event_timestamp BIGINT,
+                event_name VARCHAR(255),
+                event_id VARCHAR(255),
+                event_name_detail TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_id, event_timestamp, event_name)
+            );
+            CREATE INDEX IF NOT EXISTS idx_user_id ON {self.pg_table}(user_id);
+            CREATE INDEX IF NOT EXISTS idx_event_date ON {self.pg_table}(event_date);
+            CREATE INDEX IF NOT EXISTS idx_event_name ON {self.pg_table}(event_name);
+            CREATE INDEX IF NOT EXISTS idx_event_timestamp ON {self.pg_table}(event_timestamp);
+            """
+            cursor.execute(create_table_query)
+            self.pg_conn.commit()
+
             logger.info("Loading data to PostgreSQL...")
 
-            with self.pg_conn.cursor() as cursor:
-                batch = []
-                row_count = 0
+            insert_query = f"""
+                INSERT INTO {self.pg_table}
+                (user_id, event_date, event_timestamp, event_name, event_id, event_name_detail)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (user_id, event_timestamp, event_name) DO NOTHING
+            """
 
-                for row in data:
-                    batch.append((
-                        row.event_id,
-                        row.event_name,
-                        row.event_timestamp,
-                        row.user_id,
-                        row.session_id,
-                        row.event_data,
-                        row.user_properties,
-                        row.device_info
-                    ))
+            batch = []
+            row_count = 0
 
-                    if len(batch) >= batch_size:
-                        execute_batch(cursor, insert_query, batch)
-                        self.pg_conn.commit()
-                        row_count += len(batch)
-                        logger.info(f"Loaded {row_count} rows...")
-                        batch = []
+            for row in data:
+                # Extract event parameters (matching flask_server.py logic)
+                event_id = None
+                event_name_detail = None
 
-                # Load remaining rows
-                if batch:
+                if row.event_params:
+                    for param in row.event_params:
+                        if param.get('key') == 'id':
+                            event_id = param.get('value', {}).get('string_value')
+                        if param.get('key') == 'name':
+                            event_name_detail = param.get('value', {}).get('string_value')
+
+                batch.append((
+                    row.user_id,
+                    row.event_date,
+                    row.event_timestamp,
+                    row.event_name,
+                    event_id,
+                    event_name_detail
+                ))
+
+                if len(batch) >= batch_size:
                     execute_batch(cursor, insert_query, batch)
                     self.pg_conn.commit()
                     row_count += len(batch)
+                    logger.info(f"Loaded {row_count} rows...")
+                    batch = []
 
-                logger.info(f"Successfully loaded {row_count} rows to PostgreSQL")
-                return row_count
+            # Load remaining rows
+            if batch:
+                execute_batch(cursor, insert_query, batch)
+                self.pg_conn.commit()
+                row_count += len(batch)
+
+            cursor.close()
+            logger.info(f"Successfully loaded {row_count} rows to PostgreSQL")
+            return row_count
 
         except Exception as e:
             logger.error(f"Failed to load data to PostgreSQL: {e}")
@@ -245,24 +290,24 @@ def parse_date(date_string):
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Extract application events from BigQuery',
+        description='Extract application events from BigQuery to CSV or PostgreSQL',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Extract last 7 days to CSV
+  # Extract last 7 days to CSV (default events)
   python extract_bq.py --days 7 --output events.csv
 
-  # Extract specific date range
-  python extract_bq.py --from 2024-01-01 --to 2024-01-31 --output jan_events.csv
+  # Extract specific date range with default events
+  python extract_bq.py --from 2026-01-01 --to 2026-01-10 --output jan_events.csv
 
-  # Extract specific events only
-  python extract_bq.py --from 2024-01-01 --to 2024-01-31 --events purchase add_to_cart --output purchases.csv
+  # Extract with specific events
+  python extract_bq.py --from 2026-01-01 --to 2026-01-10 --events view_item add_to_cart --output events.csv
 
   # Load directly to PostgreSQL
-  python extract_bq.py --from 2024-01-01 --to 2024-01-31 --events login --postgres
+  python extract_bq.py --from 2026-01-01 --to 2026-01-10 --postgres
 
-  # Extract with custom filter
-  python extract_bq.py --from 2024-01-01 --to 2024-01-31 --filter "platform = 'iOS'" --output ios_events.csv
+  # Extract yesterday's data (default)
+  python extract_bq.py --days 1 --output yesterday.csv
         """
     )
 
@@ -274,8 +319,7 @@ Examples:
     parser.add_argument('--to', dest='date_to', help='End date (YYYY-MM-DD, default: today)')
 
     # Event filtering
-    parser.add_argument('--events', nargs='+', help='Specific event names to extract (space-separated)')
-    parser.add_argument('--filter', help='Additional SQL WHERE conditions')
+    parser.add_argument('--events', nargs='+', help='Specific event names to extract (space-separated). Default: predefined events')
 
     # Output options
     output_group = parser.add_mutually_exclusive_group()
@@ -300,6 +344,9 @@ Examples:
         date_from = parse_date(args.date_from)
         date_to = parse_date(args.date_to) if args.date_to else datetime.now().strftime('%Y-%m-%d')
 
+    # Use default events if not specified
+    events = args.events if args.events else DEFAULT_EVENTS
+
     # Default output
     if not args.output and not args.postgres:
         args.output = f"bq_export_{date_from}_to_{date_to}.csv"
@@ -314,11 +361,10 @@ Examples:
         extractor.connect_bigquery()
 
         # Extract data
-        data, query = extractor.extract_data(
+        data = extractor.extract_data(
             date_from=date_from,
             date_to=date_to,
-            events=args.events,
-            additional_filters=args.filter
+            events=events
         )
 
         # Export or load data
@@ -331,10 +377,13 @@ Examples:
         end_time = datetime.now()
         duration = (end_time - start_time).total_seconds()
 
-        logger.info(f"\nExtraction completed successfully!")
+        logger.info(f"\n{'='*60}")
+        logger.info(f"Extraction completed successfully!")
         logger.info(f"Date range: {date_from} to {date_to}")
+        logger.info(f"Events: {', '.join(events)}")
         logger.info(f"Total rows: {rows_processed}")
         logger.info(f"Duration: {duration:.2f} seconds")
+        logger.info(f"{'='*60}")
 
     except Exception as e:
         logger.error(f"Extraction failed: {e}")

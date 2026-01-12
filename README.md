@@ -1,189 +1,159 @@
 # BigQuery to PostgreSQL ETL
 
-ETL script to export application events from Google BigQuery to a local PostgreSQL database.
+Two simple scripts for moving data from BigQuery to PostgreSQL.
 
-## Setup
+## Scripts
 
-### 1. Install Dependencies
+### 1. flask_server.py - Automated Incremental ETL
+Flask server that runs timestamp-based incremental ETL automatically at scheduled intervals.
 
+**Features:**
+- **Incremental processing:** Uses event timestamps to track progress and resume from last processed point
+- **Resilient to failures:** Stores last processed timestamp in `last_timestamp.txt` - if ETL fails, next run continues from same point
+- **Configurable lookback window:** On first run, looks back N hours (default: 24) from current time
+- Runs daily at 2:00 AM (configurable via .env)
+- Keeps all old data (append-only)
+- Provides API endpoints for monitoring and manual triggers
+
+**Usage:**
+```bash
+python flask_server.py
+```
+
+**API Endpoints:**
+- `GET /` - Service info
+- `GET /health` - Health check
+- `GET /status` - ETL status and last run info
+- `POST /trigger` - Manually trigger ETL run
+
+### 2. manual_etl.py - Manual ETL with Parameters
+Run ETL manually with custom date range and event list.
+
+**Usage:**
+```bash
+# Run for yesterday (default)
+python manual_etl.py
+
+# Run for specific date range
+python manual_etl.py --start 2026-01-01 --end 2026-01-10
+
+# Run with custom events
+python manual_etl.py --start 2026-01-01 --end 2026-01-10 --events "view_item,add_to_cart"
+
+# Show help
+python manual_etl.py --help
+```
+
+## Configuration
+
+Create a `.env` file with:
+
+```env
+# BigQuery
+BQ_PROJECT_ID=your-project-id
+BQ_DATASET=your-dataset
+BQ_TABLE_PREFIX=events_
+BQ_CREDENTIALS_PATH=your-credentials.json
+BQ_LOCATION=europe-west1
+
+# PostgreSQL
+PG_HOST=localhost
+PG_PORT=5433
+PG_DATABASE=postgres
+PG_USER=postgres
+PG_PASSWORD=your-password
+PG_TABLE=application_events
+
+# Flask Server
+FLASK_PORT=5000
+ETL_SCHEDULE_HOUR=2
+ETL_SCHEDULE_MINUTE=0
+ETL_LOOKBACK_HOURS=24
+```
+
+## Installation
+
+### Standard Installation
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2. Configure Environment Variables
+### Docker Installation
 
-Update the `.env` file with your actual credentials:
+**Prerequisites:**
+- Docker and Docker Compose installed
+- BigQuery service account credentials JSON file
+- PostgreSQL database accessible from Docker container
 
-**BigQuery Configuration:**
-- `BQ_PROJECT_ID`: Your Google Cloud Project ID
-- `BQ_DATASET`: BigQuery dataset name (e.g., analytics_123456789)
-- `BQ_TABLE`: BigQuery table name (e.g., events_* for all event tables)
-- `BQ_CREDENTIALS_PATH`: Path to your GCP service account JSON key file
+**Quick Start:**
 
-**PostgreSQL Configuration:**
-- `PG_HOST`: PostgreSQL host (default: localhost)
-- `PG_PORT`: PostgreSQL port (default: 5432)
-- `PG_DATABASE`: PostgreSQL database name
-- `PG_USER`: PostgreSQL username
-- `PG_PASSWORD`: PostgreSQL password
-- `PG_TABLE`: Target table name (default: application_events)
+1. **Configure environment variables** - Update `.env` file with your settings:
+   ```bash
+   cp .env.example .env
+   # Edit .env with your configuration
+   ```
 
-**ETL Configuration:**
-- `BATCH_SIZE`: Number of rows to insert per batch (default: 1000)
+2. **Create data directory for state persistence:**
+   ```bash
+   mkdir -p data
+   ```
 
-### 3. BigQuery Service Account
+3. **Build and run the container:**
+   ```bash
+   docker-compose up -d
+   ```
 
-Create a service account in GCP with BigQuery permissions:
-1. Go to GCP Console > IAM & Admin > Service Accounts
-2. Create a new service account
-3. Grant it "BigQuery Data Viewer" and "BigQuery Job User" roles
-4. Create and download a JSON key
-5. Update `BQ_CREDENTIALS_PATH` in .env with the path to this file
+4. **View logs:**
+   ```bash
+   docker-compose logs -f flask-etl
+   ```
 
-### 4. PostgreSQL Setup
+5. **Check status:**
+   ```bash
+   curl http://localhost:5000/status
+   ```
 
-Ensure PostgreSQL is running locally:
+6. **Manually trigger ETL:**
+   ```bash
+   curl -X POST http://localhost:5000/trigger
+   ```
 
+7. **Stop the container:**
+   ```bash
+   docker-compose down
+   ```
+
+**Docker Build Only:**
 ```bash
-# Check if PostgreSQL is running
-psql -U postgres -c "SELECT version();"
-
-# Create a database if needed
-createdb your_postgres_database
+docker build -t bigquery-postgres-etl .
+docker run -d \
+  --name etl-server \
+  -p 5000:5000 \
+  -v $(pwd)/data:/app/data \
+  -v /path/to/credentials.json:/app/credentials.json:ro \
+  --env-file .env \
+  bigquery-postgres-etl
 ```
 
-## Usage
+## Notes
 
-### Option 1: Flexible Extraction Script (extract_bq.py)
+### General
+- Both scripts append data (don't delete old records)
+- Duplicate records are skipped automatically (based on user_id, event_timestamp, event_name)
+- **flask_server.py** uses timestamp-based incremental processing:
+  - Stores progress in `last_timestamp.txt` (or `/app/data/last_timestamp.txt` in Docker)
+  - On failure, retries from last successful timestamp
+  - On first run, looks back N hours (configured by `ETL_LOOKBACK_HOURS`)
 
-Extract data with custom date ranges and event filters:
+### Docker-Specific
+- State file (`last_timestamp.txt`) is persisted in mounted `./data` directory
+- BigQuery credentials file is mounted as read-only volume
+- Container includes health checks for monitoring
+- Auto-restarts on failure with `restart: unless-stopped` policy
+- All configuration via `.env` file - no code changes needed
+- Logs accessible via `docker-compose logs -f flask-etl`
 
-**Extract last 7 days to CSV:**
-```bash
-python extract_bq.py --days 7 --output events.csv
-```
-
-**Extract specific date range:**
-```bash
-python extract_bq.py --from 2024-01-01 --to 2024-01-31 --output jan_events.csv
-```
-
-**Extract specific events only:**
-```bash
-python extract_bq.py --from 2024-01-01 --to 2024-01-31 --events purchase add_to_cart checkout --output purchases.csv
-```
-
-**Load directly to PostgreSQL:**
-```bash
-python extract_bq.py --from 2024-01-01 --to 2024-01-31 --postgres
-```
-
-**Extract with custom filters:**
-```bash
-python extract_bq.py --from 2024-01-01 --to 2024-01-31 --filter "platform = 'iOS'" --output ios_events.csv
-```
-
-**Filter specific events and load to PostgreSQL:**
-```bash
-python extract_bq.py --from 2024-01-01 --to 2024-01-31 --events login signup --postgres
-```
-
-**Command-line options:**
-- `--from DATE` or `--days N`: Specify date range (required)
-- `--to DATE`: End date (default: today)
-- `--events EVENT1 EVENT2 ...`: Filter specific event names
-- `--filter "SQL_CONDITION"`: Additional SQL WHERE conditions
-- `--output FILE` or `-o FILE`: Export to CSV file
-- `--postgres`: Load directly to PostgreSQL database
-- `--batch-size N`: Batch size for PostgreSQL (default: 1000)
-- `--debug`: Enable debug logging
-
-### Option 2: Full ETL Script (ETL.py)
-
-Run the complete ETL process (default: last 30 days):
-
-```bash
-python ETL.py
-```
-
-### Database Schema
-
-The script automatically creates the following table structure in PostgreSQL:
-
-```sql
-CREATE TABLE application_events (
-    event_id VARCHAR(255) PRIMARY KEY,
-    event_name VARCHAR(255),
-    event_timestamp TIMESTAMP,
-    user_id VARCHAR(255),
-    session_id VARCHAR(255),
-    event_data JSONB,
-    user_properties JSONB,
-    device_info JSONB,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-```
-
-Indexes are created on:
-- event_timestamp
-- user_id
-- event_name
-
-### Customization
-
-You can modify the BigQuery query in the `extract_from_bigquery()` method to:
-- Change the date range (default: last 30 days)
-- Filter specific events
-- Add custom transformations
-
-Example:
-
-```python
-custom_query = """
-SELECT
-    event_id,
-    event_name,
-    event_timestamp,
-    user_id
-FROM `your-project.analytics_123456789.events_*`
-WHERE _TABLE_SUFFIX BETWEEN '20240101' AND '20240131'
-    AND event_name = 'purchase'
-"""
-
-etl = BigQueryToPostgresETL()
-etl.run(custom_query)
-```
-
-## Features
-
-**extract_bq.py (Flexible Extraction):**
-- Command-line interface for easy use
-- Custom date range selection (from-to dates or last N days)
-- Event name filtering (extract specific events)
-- Custom SQL WHERE conditions
-- Export to CSV or load directly to PostgreSQL
-- Multiple date format support
-- Debug mode for troubleshooting
-
-**ETL.py (Full Pipeline):**
-- Batch processing for efficient data loading
-- Automatic table creation with indexes
-- Upsert logic (INSERT ON CONFLICT UPDATE) to handle duplicates
-- Comprehensive logging
-- Error handling and connection management
-- JSONB support for complex event data
-
-## Troubleshooting
-
-**Authentication Error:**
-- Verify your service account JSON key is valid
-- Check that the service account has proper BigQuery permissions
-
-**Connection Error:**
-- Ensure PostgreSQL is running
-- Verify credentials in .env file
-- Check if the database exists
-
-**Schema Mismatch:**
-- Modify the table schema in `create_postgres_table()` to match your BigQuery structure
-- Update the SELECT query in `extract_from_bigquery()` accordingly
+### Troubleshooting
+- **PostgreSQL connection issues in Docker:** Ensure `PG_HOST` is accessible from container (use host IP or Docker network)
+- **Credentials not found:** Check that `BQ_CREDENTIALS_PATH` in `.env` points to correct file location
+- **Permission errors on data directory:** Ensure `./data` directory has proper write permissions
