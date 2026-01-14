@@ -26,22 +26,28 @@ python flask_server.py
 - `GET /status` - ETL status and last run info
 - `POST /trigger` - Manually trigger ETL run
 
-### 2. manual_etl.py - Manual ETL with Parameters
-Run ETL manually with custom date range and event list.
+### 2. extract_bq.py - Manual BigQuery Extraction Tool
+Extract data from BigQuery with custom date ranges and event filters. Can export to CSV or load directly to PostgreSQL.
 
 **Usage:**
 ```bash
-# Run for yesterday (default)
-python manual_etl.py
+# Extract last 7 days to CSV (default events)
+python extract_bq.py --days 7 --output events.csv
 
-# Run for specific date range
-python manual_etl.py --start 2026-01-01 --end 2026-01-10
+# Extract specific date range with default events
+python extract_bq.py --from 2026-01-01 --to 2026-01-10 --output jan_events.csv
 
-# Run with custom events
-python manual_etl.py --start 2026-01-01 --end 2026-01-10 --events "view_item,add_to_cart"
+# Extract with specific events
+python extract_bq.py --from 2026-01-01 --to 2026-01-10 --events view_item add_to_cart --output events.csv
+
+# Load directly to PostgreSQL
+python extract_bq.py --from 2026-01-01 --to 2026-01-10 --postgres
+
+# Extract yesterday's data
+python extract_bq.py --days 1 --output yesterday.csv
 
 # Show help
-python manual_etl.py --help
+python extract_bq.py --help
 ```
 
 ## Configuration
